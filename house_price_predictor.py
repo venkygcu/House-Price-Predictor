@@ -16,10 +16,12 @@ import matplotlib.pyplot as plt
 import pandas as pd
 from sklearn.datasets import fetch_california_housing
 from sklearn.impute import SimpleImputer
-from sklearn.linear_model import LinearRegression
+from sklearn.linear_model import LinearRegression, Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.tree import DecisionTreeRegressor
 
 RANDOM_STATE = 42
 ROOT = Path(__file__).resolve().parent
@@ -67,11 +69,32 @@ def main() -> None:
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, random_state=RANDOM_STATE
     )
-    model = Pipeline([
-        ("imputer", SimpleImputer(strategy="median")),
-        ("regressor", LinearRegression()),
-    ])
-    model.fit(X_train, y_train)
+    candidates = {
+        "Linear Regression": LinearRegression(),
+        "Ridge Regression": Ridge(alpha=1.0),
+        "Decision Tree": DecisionTreeRegressor(max_depth=5, random_state=RANDOM_STATE),
+    }
+    fitted_models = {}
+    comparison_rows = []
+    for name, estimator in candidates.items():
+        pipeline = Pipeline([
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler()),
+            ("regressor", estimator),
+        ])
+        pipeline.fit(X_train, y_train)
+        predicted = pipeline.predict(X_test)
+        fitted_models[name] = pipeline
+        comparison_rows.append({
+            "model": name,
+            "mae_100k_usd": float(mean_absolute_error(y_test, predicted)),
+            "rmse_100k_usd": float(mean_squared_error(y_test, predicted) ** 0.5),
+            "r2": float(r2_score(y_test, predicted)),
+        })
+
+    comparison = pd.DataFrame(comparison_rows).sort_values("rmse_100k_usd").reset_index(drop=True)
+    selected_name = str(comparison.loc[0, "model"])
+    model = fitted_models[selected_name]
     predictions = pd.Series(model.predict(X_test), index=y_test.index, name="predicted")
 
     metrics = {
@@ -83,10 +106,13 @@ def main() -> None:
         "features": list(X.columns),
         "target_unit": "$100,000 (1990 USD)",
         "random_state": RANDOM_STATE,
+        "selected_model": selected_name,
+        "model_comparison": comparison.round(4).to_dict(orient="records"),
     }
 
     joblib.dump(model, ARTIFACTS / "california_housing_linear_regression.joblib")
     (REPORTS / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+    comparison.round(4).to_csv(REPORTS / "model_comparison.csv", index=False)
     results = pd.DataFrame({"actual": y_test, "predicted": predictions})
     results["residual"] = results["actual"] - results["predicted"]
     results.to_csv(REPORTS / "predictions.csv", index=False)
@@ -109,23 +135,35 @@ def main() -> None:
     fig.savefig(FIGURES / "residuals.png", dpi=160)
     plt.close(fig)
 
-    coefficients = pd.Series(model.named_steps["regressor"].coef_, index=X.columns).sort_values()
-    fig, ax = plt.subplots(figsize=(7, 5))
-    coefficients.plot.barh(ax=ax, color="#0f766e", title="Linear-regression coefficients")
+    if hasattr(model.named_steps["regressor"], "coef_"):
+        coefficients = pd.Series(model.named_steps["regressor"].coef_, index=X.columns).sort_values()
+        fig, ax = plt.subplots(figsize=(7, 5))
+        coefficients.plot.barh(ax=ax, color="#0f766e", title=f"{selected_name} coefficients (scaled features)")
+        fig.tight_layout()
+        fig.savefig(FIGURES / "coefficients.png", dpi=160)
+        plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    comparison.set_index("model")["rmse_100k_usd"].plot.bar(ax=ax, color="#0f766e")
+    ax.set(ylabel="RMSE ($100,000s)", title="Held-out model comparison (lower is better)")
     fig.tight_layout()
-    fig.savefig(FIGURES / "coefficients.png", dpi=160)
+    fig.savefig(FIGURES / "model_comparison.png", dpi=160)
     plt.close(fig)
 
     (REPORTS / "model_report.md").write_text(
-        "# California Housing Linear Regression Report\n\n"
+        "# California Housing Model Comparison Report\n\n"
         f"- Dataset: {len(data):,} California block groups; 8 numeric input features.\n"
         f"- Split: {len(X_train):,} training / {len(X_test):,} test rows (random_state={RANDOM_STATE}).\n"
         "- Preprocessing: non-numeric/blank values are coerced to missing and median-imputed in the pipeline.\n"
-        "- Model: LinearRegression baseline.\n"
+        "- Preprocessing: median imputation and StandardScaler are fitted within each training pipeline.\n"
+        "- Models: Linear Regression, Ridge Regression (alpha=1), and Decision Tree (max_depth=5).\n"
+        f"- Selected model: {selected_name} (lowest held-out RMSE among candidates).\n"
         f"- MAE: {metrics['mae_100k_usd']} $100k.\n"
         f"- RMSE: {metrics['rmse_100k_usd']} $100k.\n"
         f"- R²: {metrics['r2']}.\n\n"
-        "The target represents median value in $100,000s of 1990 USD; this is an educational baseline, not a real-estate valuation tool.\n",
+        "## Held-out model comparison\n\n"
+        + comparison.round(4).to_string(index=False)
+        + "\n\nThe target represents median value in $100,000s of 1990 USD; this is an educational baseline, not a real-estate valuation tool.\n",
         encoding="utf-8",
     )
     print(json.dumps(metrics, indent=2))
